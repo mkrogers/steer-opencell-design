@@ -39,6 +39,19 @@ def _load_cell():
     )
 
 
+def _allow_workers(minimum=4):
+    """Let a test start ``minimum`` workers even on a machine with fewer CPUs.
+
+    ``run_sweep`` refuses more workers than usable CPUs (tested in
+    ``TestExecutionOptions``). The parallel tests check results and failure
+    handling, not speed, so on a small CI runner they oversubscribe instead of
+    failing or being skipped.
+    """
+    return mock.patch.object(
+        Sweep, "_usable_cpus", return_value=max(Sweep._usable_cpus(), minimum)
+    )
+
+
 def _parity_values(count):
     """``count`` cathode mass loadings: ``count - 1`` spread over 14-18.4 mg/cm²
     (where the jelly rolls still fit the can), then one out of range."""
@@ -74,9 +87,12 @@ def _failing_init(path, sha256, spec, sweep_id):
     raise RuntimeError("injected initializer fault")
 
 
-def _evaluate_by_hand(cell, parameters, metrics):
-    """Apply a case the documented way: set, then propagate, on a fresh copy."""
-    fresh = type(cell).deserialize(cell.serialize())
+def _evaluate_by_hand(parameters, metrics):
+    """Apply a case the documented way (set, then propagate) to a cell loaded
+    straight from the database, so the reference skips the extra
+    ``serialize(compress=False)`` / ``deserialize`` round trip that the sweep
+    rebuilds each case's cell with."""
+    fresh = _load_cell()
     for path, value in parameters:
         *parents, name = path.split(".")
         owner = fresh
@@ -319,9 +335,7 @@ class TestLFPFlatWoundSweep(unittest.TestCase):
 
     def test_matches_each_case_evaluated_by_hand(self):
         for result in self.result.results:
-            expected = _evaluate_by_hand(
-                self.cell, result.parameters, Sweep.DEFAULT_METRICS
-            )
+            expected = _evaluate_by_hand(result.parameters, Sweep.DEFAULT_METRICS)
             for name, value in expected.items():
                 with self.subTest(case=result.case_index, metric=name):
                     self.assertTrue(
@@ -443,9 +457,7 @@ class TestLFPFlatWoundSweep(unittest.TestCase):
         self.assertEqual(failed.metrics, {})
         self.assertEqual(failed.realized_parameters, {})
         self.assertTrue(passed.ok)
-        expected = _evaluate_by_hand(
-            self.cell, ((MASS_LOADING, 19.5),), ("energy", "mass")
-        )
+        expected = _evaluate_by_hand(((MASS_LOADING, 19.5),), ("energy", "mass"))
         self.assertEqual(passed.metrics, expected)
 
     def test_a_setter_error_is_reported_per_case(self):
@@ -733,12 +745,18 @@ class TestExecutionOptions(unittest.TestCase):
     def test_invalid_start_methods_are_rejected(self):
         for method in ("fork", "thread", 1):
             with self.subTest(method=method):
-                with self.assertRaisesRegex(
-                    Sweep.SweepSpecificationError, "start_method"
+                with (
+                    _allow_workers(2),
+                    self.assertRaisesRegex(
+                        Sweep.SweepSpecificationError, "start_method"
+                    ),
                 ):
                     run_sweep(self.cell, self.spec, workers=2, start_method=method)
-        with mock.patch.object(
-            Sweep.multiprocessing, "get_all_start_methods", return_value=["spawn"]
+        with (
+            _allow_workers(2),
+            mock.patch.object(
+                Sweep.multiprocessing, "get_all_start_methods", return_value=["spawn"]
+            ),
         ):
             with self.assertRaisesRegex(Sweep.SweepSpecificationError, "platform"):
                 run_sweep(self.cell, self.spec, workers=2, start_method="forkserver")
@@ -757,8 +775,11 @@ class TestExecutionOptions(unittest.TestCase):
             self.assertEqual(Sweep._usable_cpus(), 1)
 
     def test_one_worker_starts_no_process(self):
-        with mock.patch.object(
-            concurrent.futures, "ProcessPoolExecutor", side_effect=AssertionError
+        with (
+            _allow_workers(2),
+            mock.patch.object(
+                concurrent.futures, "ProcessPoolExecutor", side_effect=AssertionError
+            ),
         ):
             result = run_sweep(self.cell, self.spec)
             single = run_sweep(
@@ -779,6 +800,10 @@ class TestParallelSweep(unittest.TestCase):
 
     @classmethod
     def setUpClass(cls):
+        cls.usable_cpus = Sweep._usable_cpus()
+        patcher = _allow_workers(4)
+        patcher.start()
+        cls.addClassCleanup(patcher.stop)
         cls.cell = _load_cell()
         cls.baseline_bytes = cls.cell.serialize(compress=False)
         cls.small = SweepSpec(
@@ -815,7 +840,9 @@ class TestParallelSweep(unittest.TestCase):
         self.assertEqual(result.matches(reference), [])
 
     def test_parity_with_sequential_execution(self):
-        worker_counts = [n for n in (2, 4, 8) if n <= Sweep._usable_cpus()]
+        # 2 and 4 workers always (oversubscribed on a smaller machine); 8 only
+        # where there are 8 CPUs, to keep the suite's run time bounded.
+        worker_counts = [2, 4] + ([8] if self.usable_cpus >= 8 else [])
         for count in (10, 50, 100):
             spec = SweepSpec(
                 axes=(SweepAxis(MASS_LOADING, _parity_values(count)),),

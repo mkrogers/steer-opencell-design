@@ -352,6 +352,12 @@ benchmark on your own hardware before choosing `workers`.
 
 - Every parallel sweep starts new worker processes; there is no persistent
   pool across sweeps. Each worker holds its own copy of the model in memory.
+- A finished case's cell is freed by Python's cyclic garbage collector, not
+  when the case ends (the model's parent references form cycles), so a
+  process's memory grows between collections on long sweeps. On the LFP cell,
+  400 sequential cases peaked at about 1.7 GB in one process; a full
+  collection after every case would hold it near 0.56 GB but costs about
+  34 ms, roughly the time of a case, so the sweep does not force one.
 - Parallel execution needs an importable entry point: guard scripts with
   `if __name__ == "__main__":`. Interactive sessions work as long as nothing
   the workers need is defined only in the notebook.
