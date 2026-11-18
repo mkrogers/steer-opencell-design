@@ -83,6 +83,7 @@ nav:
       - Modeling Hierarchy: concepts/hierarchy.md
       - Change Propagation: concepts/propagation.md
       - Units Convention: concepts/units.md
+      - Parameter Sweeps: concepts/sweeps.md
   - API Reference:
       - api/index.md
       - Materials:

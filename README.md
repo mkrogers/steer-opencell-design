@@ -47,6 +47,7 @@ A Python package for designing and modeling lithium-ion and sodium-ion battery c
 - [Units Convention](#units-convention)
 - [Propagating Changes Through the Hierarchy](#propagating-changes-through-the-hierarchy)
 - [Serialization](#serialization)
+- [Parameter Sweeps](#parameter-sweeps)
 - [Loading from Database](#loading-from-database)
 - [STEER Ecosystem](#steer-ecosystem)
 - [Testing](#testing)
@@ -78,6 +79,7 @@ The full documentation is hosted at **[https://stanford-developers.github.io/ste
 - **Cost and mass breakdowns** — automatic roll-up of cost and mass from component level to cell level
 - **Interactive visualization** — Plotly-based cross-sections, top-down views, capacity plots, and sunburst breakdowns
 - **Serialization** — serialize and deserialize full cell configurations for storage and sharing
+- **Parameter sweeps** — reproducible full-factorial sweeps of any numeric property, each case on an isolated copy of the cell
 - **Database integration** — load reference materials and cell designs from the STEER database
 - **Change propagation** — modify any parameter and automatically recalculate all dependent properties up the hierarchy
 
@@ -1327,6 +1329,26 @@ restored_cell = ocd.CylindricalCell.deserialize(data)
 ```
 
 The serialized output is a plain Python dict that can be converted to JSON for file storage or API transport.
+
+---
+
+## Parameter Sweeps
+
+`steer_opencell_design.Utils.Sweep` evaluates a cell at every combination of a few parameter values. Each case is rebuilt from one serialized baseline, so cases never affect each other or the cell you pass in, and the result carries a manifest (baseline SHA-256, specification, versions) for replaying it:
+
+```python
+from steer_opencell_design.Utils.Sweep import SweepAxis, SweepSpec, run_sweep
+
+cell = ocd.PrismaticCell.from_database("LFP Flat Wound Prismatic Cell", table_name="cell_references")
+spec = SweepSpec(
+    axes=(SweepAxis("reference_electrode_assembly.layup.cathode.mass_loading", (15.0, 16.0, 17.0, 18.0)),),
+    metrics=("energy", "specific_energy", "cost_per_energy"),
+)
+result = run_sweep(cell, spec)
+result.to_csv("sweep.csv")
+```
+
+See the [Parameter Sweeps guide](https://stanford-developers.github.io/steer-opencell-design/concepts/sweeps/) for error handling, replay, and limitations.
 
 ---
 
