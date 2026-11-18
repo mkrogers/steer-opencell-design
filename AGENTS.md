@@ -49,6 +49,12 @@
   `FlatWoundJellyRoll.width`. Same CLI as the spiral bench; the baseline lives
   at `test/perf/BASELINE_SETTERS.json`, and `--profile` prints a per-stage
   table (stack profile, winding, measurement, layer paths, placement, tail).
+- `test/perf/bench_sweep_parallel.py` times `Utils.Sweep.run_sweep` on the LFP
+  flat-wound prismatic reference cell for 1/2/4/8 workers and 10/50/100 cases
+  (warm and cold runs, worker start-up, serialization), and `--parity` prints
+  the per-metric max abs/rel difference between sequential and parallel runs.
+  The baseline lives at `test/perf/BASELINE_SWEEPS.json`; `--update-baseline`
+  follows the same rule as the other benches. No timing is asserted in pytest.
 
 ## Code formatting
 - Use `black .` to format Python code.

@@ -79,7 +79,7 @@ The full documentation is hosted at **[https://stanford-developers.github.io/ste
 - **Cost and mass breakdowns** — automatic roll-up of cost and mass from component level to cell level
 - **Interactive visualization** — Plotly-based cross-sections, top-down views, capacity plots, and sunburst breakdowns
 - **Serialization** — serialize and deserialize full cell configurations for storage and sharing
-- **Parameter sweeps** — reproducible full-factorial sweeps of any numeric property, each case on an isolated copy of the cell
+- **Parameter sweeps** — reproducible full-factorial sweeps of any numeric property, each case on an isolated copy of the cell, sequentially or in worker processes
 - **Database integration** — load reference materials and cell designs from the STEER database
 - **Change propagation** — modify any parameter and automatically recalculate all dependent properties up the hierarchy
 
@@ -1347,6 +1347,8 @@ spec = SweepSpec(
 result = run_sweep(cell, spec)
 result.to_csv("sweep.csv")
 ```
+
+Sweeps run sequentially by default (`workers=1`). `run_sweep(cell, spec, workers=4)` evaluates the cases in four worker processes and returns the same result, but it only pays off for sweeps large enough to outweigh starting the workers: on the LFP reference cell (Apple M1), 100 cases on 4 workers ran 1.20× faster than sequential, while 10- and 50-case sweeps were slower in parallel.
 
 See the [Parameter Sweeps guide](https://stanford-developers.github.io/steer-opencell-design/concepts/sweeps/) for error handling, replay, and limitations.
 

@@ -7,11 +7,14 @@ Numerical equivalence to a hand-evaluated case uses rtol=1e-9, atol=1e-12;
 repeated runs on one machine are required to be bit-identical.
 """
 
+import concurrent.futures
 import hashlib
 import json
 import math
+import multiprocessing
 import os
 import tempfile
+import time
 import unittest
 from unittest import mock
 
@@ -34,6 +37,41 @@ def _load_cell():
     return ocd.PrismaticCell.from_database(
         "LFP Flat Wound Prismatic Cell", table_name="cell_references"
     )
+
+
+def _parity_values(count):
+    """``count`` cathode mass loadings: ``count - 1`` spread over 14-18.4 mg/cm²
+    (where the jelly rolls still fit the can), then one out of range."""
+    return [14.0 + 4.4 * i / (count - 2) for i in range(count - 1)] + [60.0]
+
+
+# Replacements for ``Sweep._worker_run`` / ``Sweep._worker_init`` that inject
+# faults into real worker processes. They are top-level, so a spawned worker
+# imports them from this module by name.
+def _crash_on_case_3(index, case_id, parameters):
+    if index == 3:
+        os._exit(13)
+    return Sweep._worker_run(index, case_id, parameters)
+
+
+def _raise_on_case_2(index, case_id, parameters):
+    if index == 2:
+        raise ValueError("injected worker fault")
+    return Sweep._worker_run(index, case_id, parameters)
+
+
+def _finish_in_reverse(index, case_id, parameters):
+    time.sleep(0.05 * (8 - index))
+    return Sweep._worker_run(index, case_id, parameters)
+
+
+def _answer_for_another_case(index, case_id, parameters):
+    result = Sweep._worker_run(index, case_id, parameters)
+    return Sweep.CaseResult.from_dict(dict(result.to_dict(), case_index=index + 100))
+
+
+def _failing_init(path, sha256, spec, sweep_id):
+    raise RuntimeError("injected initializer fault")
 
 
 def _evaluate_by_hand(cell, parameters, metrics):
@@ -599,6 +637,20 @@ class TestLFPFlatWoundSweep(unittest.TestCase):
         self.assertTrue(any("status" in p for p in problems))
         self.assertTrue(any("keys differ" in p for p in problems))
 
+    def test_matches_checks_baseline_and_units(self):
+        other = Sweep.SweepResult.from_dict(json.loads(self.result.to_json()))
+        renamed = other.results[0].to_dict()
+        renamed["metric_units"] = dict(renamed["metric_units"], energy="kWh")
+        baseline = dict(other.manifest["baseline"], sha256="0" * 64)
+        other = Sweep.SweepResult(
+            manifest=dict(other.manifest, baseline=baseline),
+            results=(Sweep.CaseResult.from_dict(renamed),) + other.results[1:],
+        )
+        problems = self.result.matches(other)
+        self.assertTrue(any("baseline sha256" in p for p in problems))
+        self.assertTrue(any("metric_units" in p for p in problems))
+        self.assertEqual(len(problems), 2)
+
     def test_succeeded_and_failed(self):
         self.assertEqual(len(self.result.succeeded), 6)
         self.assertEqual(self.result.failed, ())
@@ -661,6 +713,396 @@ class TestEnvironment(unittest.TestCase):
 
         self.assertEqual(Sweep._allowed_range(Owner(), "value"), (-math.inf, 2.0))
         self.assertIsNone(Sweep._allowed_range(Owner(), "other"))
+
+
+class TestExecutionOptions(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls):
+        cls.cell = _load_cell()
+        cls.spec = SweepSpec(
+            axes=(SweepAxis(MASS_LOADING, (16.0, 17.0)),), metrics=("energy",)
+        )
+
+    def test_invalid_worker_counts_are_rejected(self):
+        too_many = Sweep._usable_cpus() + 1
+        for workers in (0, -1, True, 2.5, "2", None, too_many):
+            with self.subTest(workers=workers):
+                with self.assertRaisesRegex(Sweep.SweepSpecificationError, "workers"):
+                    run_sweep(self.cell, self.spec, workers=workers)
+
+    def test_invalid_start_methods_are_rejected(self):
+        for method in ("fork", "thread", 1):
+            with self.subTest(method=method):
+                with self.assertRaisesRegex(
+                    Sweep.SweepSpecificationError, "start_method"
+                ):
+                    run_sweep(self.cell, self.spec, workers=2, start_method=method)
+        with mock.patch.object(
+            Sweep.multiprocessing, "get_all_start_methods", return_value=["spawn"]
+        ):
+            with self.assertRaisesRegex(Sweep.SweepSpecificationError, "platform"):
+                run_sweep(self.cell, self.spec, workers=2, start_method="forkserver")
+
+    def test_usable_cpus(self):
+        with mock.patch.object(
+            Sweep.os, "sched_getaffinity", create=True, return_value={0, 1, 2}
+        ):
+            self.assertEqual(Sweep._usable_cpus(), 3)
+        with (
+            mock.patch.object(
+                Sweep.os, "sched_getaffinity", create=True, side_effect=AttributeError
+            ),
+            mock.patch.object(Sweep.os, "cpu_count", return_value=None),
+        ):
+            self.assertEqual(Sweep._usable_cpus(), 1)
+
+    def test_one_worker_starts_no_process(self):
+        with mock.patch.object(
+            concurrent.futures, "ProcessPoolExecutor", side_effect=AssertionError
+        ):
+            result = run_sweep(self.cell, self.spec)
+            single = run_sweep(
+                self.cell,
+                SweepSpec(axes=(SweepAxis(MASS_LOADING, (16.0,)),)),
+                workers=2,
+            )
+        self.assertEqual(
+            result.manifest["execution"],
+            {"mode": "sequential", "workers": 1, "processes": 0, "start_method": None},
+        )
+        self.assertEqual(single.manifest["execution"]["mode"], "sequential")
+        self.assertEqual(single.manifest["execution"]["workers"], 2)
+
+
+class TestParallelSweep(unittest.TestCase):
+    """Process-pool execution of the LFP flat-wound prismatic reference cell."""
+
+    @classmethod
+    def setUpClass(cls):
+        cls.cell = _load_cell()
+        cls.baseline_bytes = cls.cell.serialize(compress=False)
+        cls.small = SweepSpec(
+            axes=(SweepAxis(MASS_LOADING, _parity_values(8)),),
+            metrics=("energy", "mass", "specific_energy"),
+        )
+        cls.small_reference = run_sweep(cls.cell, cls.small)
+
+    def tearDown(self):
+        self.assertEqual(multiprocessing.active_children(), [])
+
+    def _assert_parity(self, reference, result):
+        self.assertEqual(result.sweep_id, reference.sweep_id)
+        self.assertEqual(
+            result.manifest["baseline"]["sha256"],
+            reference.manifest["baseline"]["sha256"],
+        )
+        self.assertEqual(
+            [(r.case_index, r.case_id) for r in result.results],
+            [(r.case_index, r.case_id) for r in reference.results],
+        )
+        for mine, theirs in zip(result.results, reference.results):
+            self.assertEqual(mine.parameters, theirs.parameters)
+            self.assertEqual(mine.status, theirs.status)
+            self.assertEqual(mine.error_category, theirs.error_category)
+            self.assertEqual(mine.error_message, theirs.error_message)
+            self.assertEqual(mine.metric_units, theirs.metric_units)
+            self.assertEqual(set(mine.metrics), set(theirs.metrics))
+            for name, value in theirs.metrics.items():
+                self.assertTrue(
+                    math.isclose(mine.metrics[name], value, rel_tol=RTOL, abs_tol=ATOL),
+                    f"case {mine.case_index} {name}: {mine.metrics[name]!r} != {value!r}",
+                )
+        self.assertEqual(result.matches(reference), [])
+
+    def test_parity_with_sequential_execution(self):
+        worker_counts = [n for n in (2, 4, 8) if n <= Sweep._usable_cpus()]
+        for count in (10, 50, 100):
+            spec = SweepSpec(
+                axes=(SweepAxis(MASS_LOADING, _parity_values(count)),),
+                metrics=Sweep.DEFAULT_METRICS,
+            )
+            reference = run_sweep(self.cell, spec)
+            self.assertEqual(len(reference.results), count)
+            self.assertEqual(len(reference.succeeded), count - 1)
+            self.assertEqual(
+                [r.error_category for r in reference.failed], ["constraint_violation"]
+            )
+            for workers in worker_counts:
+                with self.subTest(cases=count, workers=workers):
+                    result = run_sweep(self.cell, spec, workers=workers)
+                    self.assertEqual(
+                        result.manifest["execution"],
+                        {
+                            "mode": "process_pool",
+                            "workers": workers,
+                            "processes": workers,
+                            "start_method": "spawn",
+                        },
+                    )
+                    self._assert_parity(reference, result)
+        self.assertEqual(self.cell.serialize(compress=False), self.baseline_bytes)
+
+    def test_model_failures_are_isolated_in_workers(self):
+        spec = SweepSpec(
+            axes=(
+                SweepAxis(MASS_LOADING, (16.0, 19.5)),
+                SweepAxis(COATING_THICKNESS, (60.0, 0.0)),
+            ),
+            metrics=("energy",),
+        )
+        reference = run_sweep(self.cell, spec)
+        self.assertEqual(len(reference.failed), 4)
+        result = run_sweep(self.cell, spec, workers=2)
+        self._assert_parity(reference, result)
+
+    def test_forkserver_start_method(self):
+        if "forkserver" not in multiprocessing.get_all_start_methods():
+            self.skipTest("forkserver is not available on this platform")
+        result = run_sweep(self.cell, self.small, workers=2, start_method="forkserver")
+        self.assertEqual(result.manifest["execution"]["start_method"], "forkserver")
+        self._assert_parity(self.small_reference, result)
+
+    def test_completion_order_does_not_change_the_result(self):
+        with mock.patch.object(Sweep, "_worker_run", _finish_in_reverse):
+            result = run_sweep(self.cell, self.small, workers=4)
+        self._assert_parity(self.small_reference, result)
+
+    def test_replay_from_a_stored_manifest(self):
+        reference = run_sweep(self.cell, self.small, workers=2)
+        with tempfile.TemporaryDirectory() as folder:
+            baseline_path = os.path.join(folder, "baseline.bin")
+            result_path = os.path.join(folder, "sweep.json")
+            Sweep.BaselineSnapshot.from_cell(self.cell).save(baseline_path)
+            reference.to_json(result_path)
+
+            saved = Sweep.SweepResult.from_json(result_path)
+            baseline = Sweep.BaselineSnapshot.load(
+                baseline_path, expected_sha256=saved.manifest["baseline"]["sha256"]
+            )
+            spec = SweepSpec.from_dict(saved.manifest["specification"])
+            for workers in (1, 2):
+                with self.subTest(workers=workers):
+                    replayed = run_sweep(baseline, spec, workers=workers)
+                    self.assertEqual(
+                        replayed.manifest["canonical"], saved.manifest["canonical"]
+                    )
+                    self._assert_parity(saved, replayed)
+
+    def test_a_worker_that_dies_is_an_execution_error(self):
+        with mock.patch.object(Sweep, "_worker_run", _crash_on_case_3):
+            with self.assertRaisesRegex(
+                Sweep.SweepExecutionError, "pool broke"
+            ) as caught:
+                run_sweep(self.cell, self.small, workers=2)
+        error = caught.exception
+        self.assertIsInstance(
+            error.__cause__, concurrent.futures.process.BrokenProcessPool
+        )
+        crashed = self.small_reference.results[3].case_id
+        self.assertIn(crashed, error.unfinished_case_ids)
+        self.assertIn(crashed, error.in_flight_case_ids)
+        finished = [r.case_id for r in error.partial.results]
+        self.assertNotIn(crashed, finished)
+        self.assertEqual(
+            set(error.unfinished_case_ids) | set(finished),
+            {r.case_id for r in self.small_reference.results},
+        )
+        by_id = {r.case_id: r for r in self.small_reference.results}
+        for result in error.partial.results:
+            self.assertEqual(result.metrics, by_id[result.case_id].metrics)
+        indices = [r.case_index for r in error.partial.results]
+        self.assertEqual(indices, sorted(indices))
+
+    def test_an_exception_escaping_a_worker_is_an_execution_error(self):
+        with mock.patch.object(Sweep, "_worker_run", _raise_on_case_2):
+            with self.assertRaisesRegex(
+                Sweep.SweepExecutionError, r"Case 2 .* raised in its worker"
+            ) as caught:
+                run_sweep(self.cell, self.small, workers=2)
+        error = caught.exception
+        self.assertIsInstance(error.__cause__, ValueError)
+        self.assertIn("injected worker fault", str(error))
+        case_2 = self.small_reference.results[2].case_id
+        self.assertIn(case_2, error.in_flight_case_ids)
+        self.assertIn(case_2, error.unfinished_case_ids)
+        self.assertNotIn(case_2, [r.case_id for r in error.partial.results])
+
+    def test_a_worker_answering_for_another_case_is_an_execution_error(self):
+        with mock.patch.object(Sweep, "_worker_run", _answer_for_another_case):
+            with self.assertRaisesRegex(Sweep.SweepExecutionError, "returned case"):
+                run_sweep(self.cell, self.small, workers=2)
+
+    def test_a_pool_that_cannot_start_is_an_execution_error(self):
+        with mock.patch.object(Sweep, "_worker_init", _failing_init):
+            with self.assertRaisesRegex(
+                Sweep.SweepExecutionError, "pool broke"
+            ) as caught:
+                run_sweep(self.cell, self.small, workers=2)
+        error = caught.exception
+        self.assertEqual(error.partial.results, ())
+        self.assertEqual(
+            error.unfinished_case_ids,
+            tuple(r.case_id for r in self.small_reference.results),
+        )
+
+    def test_a_pool_that_rejects_cases_is_an_execution_error(self):
+        pool = mock.MagicMock()
+        pool.submit.side_effect = RuntimeError("cannot schedule new futures")
+        with mock.patch.object(
+            concurrent.futures, "ProcessPoolExecutor", return_value=pool
+        ):
+            with self.assertRaisesRegex(
+                Sweep.SweepExecutionError, "cannot accept cases"
+            ):
+                run_sweep(self.cell, self.small, workers=2)
+        pool.shutdown.assert_called_once_with(wait=True, cancel_futures=True)
+
+    def test_workers_and_baseline_file_are_cleaned_up(self):
+        folders = []
+        real = tempfile.TemporaryDirectory
+
+        def spy(*args, **kwargs):
+            folder = real(*args, **kwargs)
+            folders.append(folder.name)
+            return folder
+
+        with mock.patch.object(Sweep.tempfile, "TemporaryDirectory", spy):
+            run_sweep(self.cell, self.small, workers=2)
+            with mock.patch.object(
+                concurrent.futures, "wait", side_effect=KeyboardInterrupt
+            ):
+                with self.assertRaises(KeyboardInterrupt):
+                    run_sweep(self.cell, self.small, workers=2)
+        self.assertEqual(len(folders), 2)
+        for folder in folders:
+            self.assertFalse(os.path.exists(folder))
+
+    def test_baseline_is_unchanged(self):
+        run_sweep(self.cell, self.small, workers=2)
+        self.assertEqual(self.cell.serialize(compress=False), self.baseline_bytes)
+
+
+class TestWorkerFunctions(unittest.TestCase):
+    """The worker entry points, run in this process."""
+
+    @classmethod
+    def setUpClass(cls):
+        cls.cell = _load_cell()
+        cls.snapshot = Sweep.BaselineSnapshot.from_cell(cls.cell)
+        cls.spec = SweepSpec(
+            axes=(SweepAxis(MASS_LOADING, (16.0,)),), metrics=("mass",)
+        )
+
+    def tearDown(self):
+        Sweep._WORKER_STATE = None
+
+    def test_worker_evaluates_like_the_sequential_runner(self):
+        (case,) = Sweep.generate_cases(self.spec, self.snapshot)
+        with tempfile.TemporaryDirectory() as folder:
+            path = os.path.join(folder, "baseline.bin")
+            self.snapshot.save(path)
+            with self.assertRaisesRegex(Sweep.BaselineSnapshotError, "expected"):
+                Sweep._worker_init(path, "0" * 64, self.spec, "sweep")
+            Sweep._worker_init(path, self.snapshot.sha256, self.spec, "sweep")
+        result = Sweep._worker_run(case.index, case.case_id, case.parameters)
+        expected = Sweep._evaluate(self.snapshot, self.spec, case, "sweep")
+        self.assertEqual(result.metrics, expected.metrics)
+        self.assertEqual(result.case_id, case.case_id)
+        with self.assertRaisesRegex(RuntimeError, "different case ID"):
+            Sweep._worker_run(case.index, "0" * 16, case.parameters)
+
+    def test_an_uninitialized_worker_refuses_cases(self):
+        Sweep._WORKER_STATE = None
+        with self.assertRaisesRegex(RuntimeError, "not initialized"):
+            Sweep._worker_run(0, "0" * 16, ((MASS_LOADING, 16.0),))
+
+
+class TestSequentialExecutionErrors(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls):
+        cls.cell = _load_cell()
+        cls.spec = SweepSpec(
+            axes=(SweepAxis(MASS_LOADING, (16.0, 17.0, 18.0)),), metrics=("energy",)
+        )
+
+    def test_an_exception_escaping_a_case_is_an_execution_error(self):
+        real = Sweep._evaluate
+        calls = []
+
+        def flaky(*args):
+            calls.append(args)
+            if len(calls) == 2:
+                raise MemoryError("injected")
+            return real(*args)
+
+        with mock.patch.object(Sweep, "_evaluate", flaky):
+            with self.assertRaisesRegex(
+                Sweep.SweepExecutionError, r"Case 1 .* outside case evaluation"
+            ) as caught:
+                run_sweep(self.cell, self.spec)
+        error = caught.exception
+        self.assertIsInstance(error.__cause__, MemoryError)
+        self.assertEqual([r.case_index for r in error.partial.results], [0])
+        self.assertEqual(len(error.unfinished_case_ids), 2)
+        self.assertEqual(error.in_flight_case_ids, error.unfinished_case_ids[:1])
+
+    def test_a_parameter_that_cannot_be_read_back_fails_its_case(self):
+        real = Sweep._resolve
+        calls = []
+
+        def resolve(cell, path):
+            calls.append(path)
+            if len(calls) == 3:  # the probe, the set, then the read-back
+                raise RuntimeError("detached")
+            return real(cell, path)
+
+        spec = SweepSpec(axes=(SweepAxis(MASS_LOADING, (16.0,)),), metrics=("energy",))
+        with mock.patch.object(Sweep, "_resolve", resolve):
+            (result,) = run_sweep(self.cell, spec).results
+        self.assertEqual(result.error_category, "resolution_error")
+        self.assertIn("cannot be read back", result.error_message)
+        self.assertEqual(result.metrics, {})
+
+
+class TestErrorKinds(unittest.TestCase):
+    def test_every_category_has_a_kind(self):
+        categories = {
+            value
+            for name, value in vars(Sweep).items()
+            if name.isupper()
+            and name.endswith(("_ERROR", "_VIOLATION", "_METRIC", "_REALIZED"))
+        }
+        self.assertEqual(categories, set(Sweep.ERROR_KINDS))
+        self.assertEqual(
+            set(Sweep.ERROR_KINDS.values()),
+            {"invalid_parameters", "model_evaluation", "serialization"},
+        )
+
+    def test_error_kind_of_a_result(self):
+        fields = dict(
+            sweep_id="s",
+            case_id="c",
+            case_index=0,
+            parameters=(),
+            parameter_units={},
+            realized_parameters={},
+            metrics={},
+            metric_units={},
+            error_message=None,
+            elapsed_s=0.0,
+        )
+        kinds = {
+            "setter_error": "model_evaluation",
+            "constraint_violation": "invalid_parameters",
+            "reconstruction_error": "serialization",
+        }
+        for category, kind in kinds.items():
+            result = Sweep.CaseResult(
+                status="failed", error_category=category, **fields
+            )
+            self.assertEqual(result.error_kind, kind)
+        ok = Sweep.CaseResult(status="ok", error_category=None, **fields)
+        self.assertIsNone(ok.error_kind)
 
 
 if __name__ == "__main__":

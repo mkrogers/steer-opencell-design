@@ -70,14 +70,41 @@ shortest round-tripping ``repr``, which is the same on every platform.
 - Cases are enumerated with ``itertools.product`` over the axes in declared
   order: the first axis varies slowest and the last fastest.
 
-Machine-specific metadata (versions, platform, git revision, timings) is kept
-out of both fingerprints. Metrics are compared across runs with a relative
-tolerance of ``1e-9`` and an absolute tolerance of ``1e-12``; on one machine
-and environment repeated runs are bit-identical.
+Machine-specific metadata (versions, platform, git revision, timings, how the
+sweep was executed) is kept out of both fingerprints. Metrics are compared
+across runs with a relative tolerance of ``1e-9`` and an absolute tolerance of
+``1e-12``; on one machine and environment repeated runs are bit-identical.
+
+Execution
+---------
+``workers=1`` (the default) evaluates the cases one after another in the
+calling process; it is the reference implementation and starts no process. It
+is also usually the faster choice: in the measured benchmark, parallel
+execution beat it only for 100 cases on 4 workers (1.20x).
+
+``workers=N`` evaluates them in ``N`` worker processes of a
+``concurrent.futures.ProcessPoolExecutor`` started with ``spawn`` (or
+``forkserver``; ``fork`` is refused). Each worker receives the baseline bytes,
+the specification and the sweep ID once, through the pool initializer, checks
+the bytes against the baseline SHA-256, and then evaluates cases with the same
+function as ``workers=1``, each on its own freshly deserialized cell. Only the
+case index, case ID and parameter values are sent per case, at most ``2 * N``
+cases are queued at a time, and results are put back in case-index order, so
+the result does not depend on which worker finishes first. On one machine the
+results equal the sequential ones exactly.
+
+A case that fails inside the model is a failed :class:`CaseResult`, whichever
+mode runs it. Anything else — a worker that dies, a pool that cannot start, an
+exception that escapes case evaluation — is not a case result: the sweep
+raises :class:`SweepExecutionError`, which carries the cases finished so far
+and the IDs of the ones that were not. There is no silent fallback to
+sequential execution. The pool is shut down, and its processes joined, on
+success, on error and on interruption.
 
 Limitations
 -----------
-- Sweeps run sequentially in the calling process.
+- Parallel execution pays a process start-up (interpreter, imports, baseline
+  transfer) on every sweep; it helps only when the cases outweigh it.
 - The container is never resized: a parameter that grows an electrode assembly
   can leave it larger than the container, and the model reports no error.
 - A ``<name>_range`` is checked only where the owner defines one; a later axis
@@ -86,6 +113,8 @@ Limitations
 
 from __future__ import annotations
 
+import concurrent.futures
+import concurrent.futures.process
 import csv
 import hashlib
 import inspect
@@ -93,11 +122,13 @@ import io
 import itertools
 import json
 import math
+import multiprocessing
 import numbers
 import os
 import platform
 import re
 import subprocess
+import tempfile
 import time
 from collections.abc import Iterable
 from dataclasses import dataclass, field
@@ -118,6 +149,7 @@ __all__ = [
     "SWEEP_SCHEMA_VERSION",
     "SweepAxis",
     "SweepCase",
+    "SweepExecutionError",
     "SweepResult",
     "SweepSpec",
     "SweepSpecificationError",
@@ -150,6 +182,26 @@ PROPAGATION_ERROR = "propagation_error"
 VALUE_NOT_REALIZED = "value_not_realized"
 METRIC_ERROR = "metric_error"
 NON_FINITE_METRIC = "non_finite_metric"
+
+ERROR_KINDS: Dict[str, str] = {
+    CONSTRAINT_VIOLATION: "invalid_parameters",
+    RESOLUTION_ERROR: "invalid_parameters",
+    VALUE_NOT_REALIZED: "invalid_parameters",
+    CONSTRAINT_ERROR: "model_evaluation",
+    SETTER_ERROR: "model_evaluation",
+    PROPAGATION_ERROR: "model_evaluation",
+    METRIC_ERROR: "model_evaluation",
+    NON_FINITE_METRIC: "model_evaluation",
+    RECONSTRUCTION_ERROR: "serialization",
+}
+"""The kind of each error category: an invalid parameter combination, a failure
+inside the model, or a baseline that could not be rebuilt. Infrastructure
+failures are never case results; they raise :class:`SweepExecutionError`."""
+
+START_METHODS = ("spawn", "forkserver")
+"""Process start methods a parallel sweep accepts (``fork`` is refused)."""
+
+_IN_FLIGHT_PER_WORKER = 2
 
 METRIC_UNITS: Dict[str, str] = {
     "reversible_capacity": "Ah",
@@ -204,6 +256,37 @@ class SweepSpecificationError(ValueError):
 
 class BaselineSnapshotError(ValueError):
     """A baseline cell cannot be snapshotted reproducibly."""
+
+
+class SweepExecutionError(RuntimeError):
+    """The sweep could not be carried out (not a failure of one case's model).
+
+    Raised when a worker process dies, the process pool cannot start, or an
+    exception escapes case evaluation. The cause is chained (``__cause__``),
+    including the worker's traceback for an exception raised in a worker.
+
+    Attributes
+    ----------
+    partial : SweepResult
+        The manifest and the cases that finished, in case-index order.
+    unfinished_case_ids : tuple of str
+        IDs of every case without a result, in case-index order.
+    in_flight_case_ids : tuple of str
+        IDs of the cases that were running or queued when the failure
+        happened; a case that crashed its worker is among them.
+    """
+
+    def __init__(
+        self,
+        message: str,
+        partial: "SweepResult",
+        unfinished_case_ids: Sequence[str],
+        in_flight_case_ids: Sequence[str],
+    ) -> None:
+        super().__init__(message)
+        self.partial = partial
+        self.unfinished_case_ids = tuple(unfinished_case_ids)
+        self.in_flight_case_ids = tuple(in_flight_case_ids)
 
 
 # ---------------------------------------------------------------------------
@@ -713,8 +796,13 @@ def _apply(
 
     realized = {}
     for path, value in parameters:
-        owner, name = _resolve(cell, path)
-        actual = float(getattr(owner, name))
+        try:
+            owner, name = _resolve(cell, path)
+            actual = float(getattr(owner, name))
+        except Exception as exc:
+            raise _CaseFailure(
+                RESOLUTION_ERROR, f"{path} cannot be read back: {_describe(exc)}"
+            ) from exc
         if not math.isclose(actual, value, rel_tol=RTOL, abs_tol=ATOL):
             raise _CaseFailure(
                 VALUE_NOT_REALIZED,
@@ -755,6 +843,12 @@ class CaseResult:
     def ok(self) -> bool:
         """Whether the case was evaluated."""
         return self.status == STATUS_OK
+
+    @property
+    def error_kind(self) -> Optional[str]:
+        """``"invalid_parameters"``, ``"model_evaluation"`` or ``"serialization"``
+        for a failed case (see ``ERROR_KINDS``); ``None`` for one that succeeded."""
+        return ERROR_KINDS.get(self.error_category)
 
     def to_dict(self) -> Dict[str, Any]:
         """JSON-compatible form, read back by :meth:`from_dict`."""
@@ -830,7 +924,10 @@ def _git_state() -> Optional[Dict[str, Any]]:
 
 
 def _build_manifest(
-    spec: SweepSpec, snapshot: BaselineSnapshot, baseline_metrics: Dict[str, float]
+    spec: SweepSpec,
+    snapshot: BaselineSnapshot,
+    baseline_metrics: Dict[str, float],
+    execution: Dict[str, Any],
 ) -> Dict[str, Any]:
     canonical = {
         "schema_version": spec.schema_version,
@@ -856,6 +953,7 @@ def _build_manifest(
             "metrics": baseline_metrics,
         },
         "environment": _environment(),
+        "execution": execution,
     }
 
 
@@ -1006,13 +1104,18 @@ class SweepResult:
     ) -> List[str]:
         """Differences from ``other``; empty when the two sweeps agree.
 
-        Compares the sweep ID, the cases in order (ID, status, error category)
-        and every metric and realized parameter within ``rtol`` / ``atol``.
-        Timings and environment metadata are ignored.
+        Compares the sweep ID, the baseline SHA-256, the cases in order (ID,
+        parameters, status, error category, metric units) and every metric and
+        realized parameter within ``rtol`` / ``atol``. Timings, the
+        environment and how the sweep was executed are ignored.
         """
         problems = []
         if self.sweep_id != other.sweep_id:
             problems.append(f"sweep_id {self.sweep_id} != {other.sweep_id}")
+        mine_sha = self.manifest.get("baseline", {}).get("sha256")
+        theirs_sha = other.manifest.get("baseline", {}).get("sha256")
+        if mine_sha != theirs_sha:
+            problems.append(f"baseline sha256 {mine_sha} != {theirs_sha}")
         if len(self.results) != len(other.results):
             problems.append(f"{len(self.results)} cases != {len(other.results)} cases")
         for mine, theirs in zip(self.results, other.results):
@@ -1023,6 +1126,7 @@ class SweepResult:
                 "parameters",
                 "status",
                 "error_category",
+                "metric_units",
             ):
                 if getattr(mine, name) != getattr(theirs, name):
                     problems.append(
@@ -1077,8 +1181,185 @@ def _evaluate(
     )
 
 
-def run_sweep(baseline: Any, spec: SweepSpec) -> SweepResult:
-    """Evaluate every case of ``spec`` on ``baseline``, sequentially.
+def _usable_cpus() -> int:
+    """CPUs this process may run on."""
+    try:
+        return len(os.sched_getaffinity(0))
+    except AttributeError:  # macOS, Windows
+        return os.cpu_count() or 1
+
+
+def _validate_execution(workers: Any, start_method: Any) -> Tuple[int, str]:
+    if (
+        isinstance(workers, bool)
+        or not isinstance(workers, numbers.Integral)
+        or workers < 1
+    ):
+        raise SweepSpecificationError(
+            f"workers must be a positive integer, got {workers!r}."
+        )
+    workers = int(workers)
+    available = _usable_cpus()
+    if workers > available:
+        raise SweepSpecificationError(
+            f"workers={workers} is more than the {available} CPUs available to "
+            "this process."
+        )
+    if start_method is None:
+        start_method = "spawn"
+    if start_method not in START_METHODS:
+        raise SweepSpecificationError(
+            f"start_method must be one of {START_METHODS}, got {start_method!r}."
+        )
+    if start_method not in multiprocessing.get_all_start_methods():
+        raise SweepSpecificationError(
+            f"The {start_method!r} start method is not available on this platform."
+        )
+    return workers, start_method
+
+
+class _ExecutionFailure(Exception):
+    def __init__(self, message: str, in_flight: Iterable[SweepCase]) -> None:
+        super().__init__(message)
+        self.in_flight = sorted(in_flight, key=lambda case: case.index)
+
+
+# State of a worker process, set once by ``_worker_init``.
+_WORKER_STATE: Optional[Tuple[BaselineSnapshot, SweepSpec, str]] = None
+
+
+def _worker_init(path: str, sha256: str, spec: SweepSpec, sweep_id: str) -> None:
+    """Pool initializer: load and check the baseline snapshot in this worker."""
+    global _WORKER_STATE
+    snapshot = BaselineSnapshot.load(path, expected_sha256=sha256)
+    _WORKER_STATE = (snapshot, spec, sweep_id)
+
+
+def _worker_run(
+    index: int, case_id: str, parameters: Tuple[Tuple[str, Number], ...]
+) -> CaseResult:
+    """Evaluate one case in a worker, exactly as ``workers=1`` does."""
+    if _WORKER_STATE is None:
+        raise RuntimeError("The sweep worker was not initialized.")
+    snapshot, spec, sweep_id = _WORKER_STATE
+    if _case_id(snapshot, parameters) != case_id:
+        raise RuntimeError(
+            f"Case {index}: the worker derives a different case ID than {case_id}."
+        )
+    case = SweepCase(index=index, case_id=case_id, parameters=tuple(parameters))
+    return _evaluate(snapshot, spec, case, sweep_id)
+
+
+def _run_sequential(
+    snapshot: BaselineSnapshot,
+    spec: SweepSpec,
+    cases: Sequence[SweepCase],
+    sweep_id: str,
+    done: Dict[int, CaseResult],
+) -> None:
+    for case in cases:
+        try:
+            done[case.index] = _evaluate(snapshot, spec, case, sweep_id)
+        except Exception as exc:
+            raise _ExecutionFailure(
+                f"Case {case.index} ({case.case_id}) raised outside case "
+                f"evaluation: {_describe(exc)}",
+                in_flight=(case,),
+            ) from exc
+
+
+def _run_parallel(
+    snapshot: BaselineSnapshot,
+    spec: SweepSpec,
+    cases: Sequence[SweepCase],
+    sweep_id: str,
+    processes: int,
+    start_method: str,
+    done: Dict[int, CaseResult],
+) -> None:
+    # The baseline goes to the workers through a private temporary file, not
+    # the initializer arguments: with spawn, those are written into each new
+    # worker's bootstrap pipe, and a payload larger than the pipe buffer blocks
+    # the parent until that worker has imported the package and read it, which
+    # serializes worker start-up. The directory is removed once the pool is
+    # shut down.
+    with tempfile.TemporaryDirectory(prefix="opencell-sweep-") as folder:
+        baseline_path = os.path.join(folder, "baseline.bin")
+        snapshot.save(baseline_path)
+        executor = concurrent.futures.ProcessPoolExecutor(
+            max_workers=processes,
+            mp_context=multiprocessing.get_context(start_method),
+            initializer=_worker_init,
+            initargs=(baseline_path, snapshot.sha256, spec, sweep_id),
+        )
+        pending: Dict[concurrent.futures.Future, SweepCase] = {}
+        queue = iter(cases)
+        limit = processes * _IN_FLIGHT_PER_WORKER
+        try:
+            while True:
+                for case in itertools.islice(queue, limit - len(pending)):
+                    try:
+                        future = executor.submit(
+                            _worker_run, case.index, case.case_id, case.parameters
+                        )
+                    except Exception as exc:
+                        raise _ExecutionFailure(
+                            f"The worker process pool cannot accept cases: {_describe(exc)}",
+                            in_flight=(case, *pending.values()),
+                        ) from exc
+                    pending[future] = case
+                if not pending:
+                    return
+                finished, _ = concurrent.futures.wait(
+                    pending, return_when=concurrent.futures.FIRST_COMPLETED
+                )
+                failure = None
+                for future in sorted(finished, key=lambda f: pending[f].index):
+                    case = pending[future]
+                    exc = future.exception()
+                    if exc is None:
+                        result = future.result()
+                        if (result.case_index, result.case_id) != (
+                            case.index,
+                            case.case_id,
+                        ):
+                            exc = RuntimeError(
+                                f"A worker returned case {result.case_index} "
+                                f"({result.case_id}) for case {case.index} ({case.case_id})."
+                            )
+                        else:
+                            del pending[future]
+                            done[case.index] = result
+                            continue
+                    if failure is None:
+                        failure = (case, exc)
+                if failure is not None:
+                    case, exc = failure
+                    if isinstance(exc, concurrent.futures.process.BrokenProcessPool):
+                        message = (
+                            "The worker process pool broke: a worker process died or "
+                            f"could not start ({_describe(exc)})"
+                        )
+                    else:
+                        message = (
+                            f"Case {case.index} ({case.case_id}) raised in its worker "
+                            f"outside case evaluation: {_describe(exc)}"
+                        )
+                    raise _ExecutionFailure(
+                        message, in_flight=pending.values()
+                    ) from exc
+        finally:
+            executor.shutdown(wait=True, cancel_futures=True)
+
+
+def run_sweep(
+    baseline: Any,
+    spec: SweepSpec,
+    *,
+    workers: int = 1,
+    start_method: Optional[str] = None,
+) -> SweepResult:
+    """Evaluate every case of ``spec`` on ``baseline``.
 
     Parameters
     ----------
@@ -1088,6 +1369,20 @@ def run_sweep(baseline: Any, spec: SweepSpec) -> SweepResult:
         replay a sweep.
     spec : SweepSpec
         What to vary and what to measure.
+    workers : int
+        ``1`` (the default) evaluates the cases one after another in this
+        process. ``N > 1`` evaluates them in up to ``N`` worker processes (no
+        more than there are cases); ``N`` may not exceed the CPUs available
+        to this process. The results are the same either way. Each parallel
+        sweep pays a start-up of about a second, so ``1`` is usually faster:
+        for the LFP flat-wound prismatic reference cell on an Apple M1, only
+        100 cases on 4 workers beat sequential (1.20x, 2.85 s vs 3.42 s);
+        10 and 50 cases, and 8 workers, were slower (see the Parameter Sweeps
+        guide).
+    start_method : {"spawn", "forkserver"}, optional
+        How worker processes are started; ``"spawn"`` when omitted. ``"fork"``
+        is refused. A script that runs a parallel sweep must guard its entry
+        point with ``if __name__ == "__main__":``.
 
     Returns
     -------
@@ -1098,15 +1393,20 @@ def run_sweep(baseline: Any, spec: SweepSpec) -> SweepResult:
     Raises
     ------
     SweepSpecificationError
-        If a path or metric does not apply to the baseline cell; nothing is
-        evaluated then.
+        If a path or metric does not apply to the baseline cell, or the
+        execution options are invalid; nothing is evaluated then.
     BaselineSnapshotError
         If the baseline cannot be snapshotted reproducibly.
+    SweepExecutionError
+        If the sweep cannot be carried out: a worker process dies, the pool
+        cannot start, or an exception escapes case evaluation. It carries the
+        finished cases and the IDs of the unfinished ones.
     """
     if not isinstance(spec, SweepSpec):
         raise SweepSpecificationError(
             f"spec must be a SweepSpec, got {type(spec).__name__}."
         )
+    workers, start_method = _validate_execution(workers, start_method)
     snapshot = (
         baseline
         if isinstance(baseline, BaselineSnapshot)
@@ -1128,10 +1428,37 @@ def run_sweep(baseline: Any, spec: SweepSpec) -> SweepResult:
             f"The baseline's metrics cannot be read: {failure.message}"
         ) from failure
 
-    manifest = _build_manifest(spec, snapshot, baseline_metrics)
+    cases = generate_cases(spec, snapshot)
+    processes = min(workers, len(cases))
+    parallel = processes > 1
+    execution = {
+        "mode": "process_pool" if parallel else "sequential",
+        "workers": workers,
+        "processes": processes if parallel else 0,
+        "start_method": start_method if parallel else None,
+    }
+    manifest = _build_manifest(spec, snapshot, baseline_metrics, execution)
     sweep_id = manifest["sweep_id"]
-    results = tuple(
-        _evaluate(snapshot, spec, case, sweep_id)
-        for case in generate_cases(spec, snapshot)
+
+    done: Dict[int, CaseResult] = {}
+    try:
+        if parallel:
+            _run_parallel(
+                snapshot, spec, cases, sweep_id, processes, start_method, done
+            )
+        else:
+            _run_sequential(snapshot, spec, cases, sweep_id, done)
+    except _ExecutionFailure as failure:
+        partial = SweepResult(
+            manifest=manifest, results=tuple(done[i] for i in sorted(done))
+        )
+        unfinished = [case.case_id for case in cases if case.index not in done]
+        raise SweepExecutionError(
+            f"{failure} {len(done)} of {len(cases)} cases finished.",
+            partial=partial,
+            unfinished_case_ids=unfinished,
+            in_flight_case_ids=[case.case_id for case in failure.in_flight],
+        ) from failure.__cause__
+    return SweepResult(
+        manifest=manifest, results=tuple(done[case.index] for case in cases)
     )
-    return SweepResult(manifest=manifest, results=results)
